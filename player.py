@@ -21,7 +21,7 @@ YTDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "cookiefile": os.getenv("YTDL_COOKIES", "cookies.txt")  # uses env var or default file
+    "cookiefile": "cookies.txt"  # uses env var or default file
 }
 
 FFMPEG_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -vn -hide_banner"
