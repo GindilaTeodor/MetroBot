@@ -4,9 +4,9 @@ Music player helpers. This module defines a MusicManager and a MusicPlayer
 class that handle per-guild queues and playback using yt-dlp and ffmpeg.
 
 Features:
-- Buffered audio download to avoid HLS 403 in cloud environments
 - Auto-disconnect after inactivity (default 5 min)
 - Auto-disconnect if alone in VC
+- Fully downloads tracks before playing to avoid streaming HLS issues
 """
 
 import asyncio
@@ -17,17 +17,20 @@ import functools
 import os
 import tempfile
 
-# YTDLP options
+# ---------- yt-dlp options ----------
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "cookiefile": "cookies.txt"
+    "cookiefile": "cookies.txt"  # change to your cookies file if needed
 }
 
-FFMPEG_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -vn -hide_banner"
+FFMPEG_OPTIONS = "-nostdin -hide_banner"
 
+YTDL = yt_dlp.YoutubeDL(YTDL_OPTS)
+
+# ---------- Track dataclass ----------
 @dataclass
 class Track:
     title: str
@@ -35,15 +38,11 @@ class Track:
     source_url: str
     duration: int
     requester: discord.Member
-    temp_file: str | None = None
+    file_path: str | None = None  # temp file path after download
 
+# ---------- MusicPlayer ----------
 class MusicPlayer:
-    def __init__(
-        self,
-        guild_id: int,
-        loop: asyncio.AbstractEventLoop,
-        voice_client: discord.VoiceClient,
-    ):
+    def __init__(self, guild_id: int, loop: asyncio.AbstractEventLoop, voice_client: discord.VoiceClient):
         self.guild_id = guild_id
         self.loop = loop
         self.voice_client = voice_client
@@ -54,31 +53,16 @@ class MusicPlayer:
         self._task = self.loop.create_task(self.player_loop())
 
     async def queue_entry(self, query: str, requester: discord.Member) -> Track:
-        info = await self.loop.run_in_executor(
-            None, functools.partial(extract_info, query)
-        )
-
-        # Download audio to temp file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
-        temp_file_path = temp_file.name
-        temp_file.close()  # yt-dlp will write to this path
-
-        YTDL_OPTS_DOWNLOAD = YTDL_OPTS.copy()
-        YTDL_OPTS_DOWNLOAD.update({"outtmpl": temp_file_path})
-        ytdl_download = yt_dlp.YoutubeDL(YTDL_OPTS_DOWNLOAD)
-
-        await self.loop.run_in_executor(None, lambda: ytdl_download.download([info["webpage_url"]]))
-
+        info = await self.loop.run_in_executor(None, functools.partial(extract_info, query))
         track = Track(
             title=info.get("title"),
-            url=temp_file_path,  # use local file for FFmpeg
+            url=info.get("url"),
             source_url=info.get("webpage_url"),
             duration=info.get("duration") or 0,
             requester=requester,
-            temp_file=temp_file_path
         )
-
         await self.queue.put(track)
+        # Reset auto-disconnect timer
         await self.start_auto_disconnect()
         return track
 
@@ -87,8 +71,11 @@ class MusicPlayer:
             self.play_next_event.clear()
             self.current = await self.queue.get()
 
+            # Download track fully before playing
+            self.current.file_path = await self.loop.run_in_executor(None, download_track, self.current.url)
+
             source = discord.FFmpegPCMAudio(
-                self.current.url,
+                self.current.file_path,
                 before_options=FFMPEG_OPTIONS,
                 executable=os.getenv("FFMPEG_PATH", "ffmpeg")
             )
@@ -96,10 +83,10 @@ class MusicPlayer:
             def after_playing(err):
                 if err:
                     print("Player error:", err)
-                # Remove temp file
-                if self.current and self.current.temp_file:
+                # cleanup temp file
+                if self.current and self.current.file_path:
                     try:
-                        os.remove(self.current.temp_file)
+                        os.remove(self.current.file_path)
                     except Exception:
                         pass
                 self.loop.call_soon_threadsafe(self.play_next_event.set)
@@ -107,6 +94,7 @@ class MusicPlayer:
             self.voice_client.play(source, after=after_playing)
             await self.play_next_event.wait()
             self.current = None
+            # Start auto-disconnect after finishing song
             await self.start_auto_disconnect()
 
     async def skip(self):
@@ -127,31 +115,28 @@ class MusicPlayer:
     async def start_auto_disconnect(self, timeout: int = 300):
         if self.auto_disconnect_task and not self.auto_disconnect_task.done():
             self.auto_disconnect_task.cancel()
-        self.auto_disconnect_task = self.loop.create_task(
-            self._auto_disconnect(timeout)
-        )
+        self.auto_disconnect_task = self.loop.create_task(self._auto_disconnect(timeout))
 
     async def _auto_disconnect(self, timeout: int):
         await asyncio.sleep(timeout)
         if not self.voice_client or not self.voice_client.is_connected():
             return
+        # Leave immediately if alone
         if len(self.voice_client.channel.members) == 1:
             await self.voice_client.disconnect()
             return
+        # Wait a short time for FFmpeg to finalize
         await asyncio.sleep(1)
+        # Disconnect if nothing is playing and queue is empty
         if not self.voice_client.is_playing() and self.queue.empty() and self.current is None:
             await self.voice_client.disconnect()
 
+# ---------- MusicManager ----------
 class MusicManager:
     def __init__(self):
         self.players: dict[int, MusicPlayer] = {}
 
-    def get_player(
-        self,
-        guild_id: int,
-        loop: asyncio.AbstractEventLoop,
-        voice_client: discord.VoiceClient,
-    ) -> MusicPlayer:
+    def get_player(self, guild_id: int, loop: asyncio.AbstractEventLoop, voice_client: discord.VoiceClient) -> MusicPlayer:
         if guild_id not in self.players:
             self.players[guild_id] = MusicPlayer(guild_id, loop, voice_client)
         return self.players[guild_id]
@@ -173,9 +158,7 @@ class MusicManager:
                 player.auto_disconnect_task.cancel()
             del self.players[guild_id]
 
-# yt-dlp helper
-YTDL = yt_dlp.YoutubeDL(YTDL_OPTS)
-
+# ---------- yt-dlp helper functions ----------
 def extract_info(query: str) -> dict:
     if query.startswith("http"):
         inq = query
@@ -185,3 +168,20 @@ def extract_info(query: str) -> dict:
     if "entries" in info:
         info = info["entries"][0]
     return info
+
+def download_track(track_url: str) -> str:
+    """
+    Fully downloads the track to a temp file and returns the file path.
+    """
+    ytdl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "cookiefile": "cookies.txt",
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+        info = ydl.extract_info(track_url, download=True)
+        filename = ydl.prepare_filename(info)
+        return filename
