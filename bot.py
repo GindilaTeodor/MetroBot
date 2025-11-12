@@ -1,57 +1,36 @@
-"""
-Main Discord bot. Uses player.py for music playback.
-
-Usage (locally):
-1. Install requirements: pip install -r requirements.txt
-2. Ensure ffmpeg is installed and available on PATH.
-3. Set environment variable DISCORD_TOKEN with your bot token.
-4. python bot.py
-
-This file also contains a small Flask keepalive server so you can deploy
-as a Web Service on Render if you prefer (the web server runs in a thread).
-"""
-
+# ---------- bot.py ----------
 import os
 import asyncio
 import logging
 from discord.ext import commands
 import discord
 from player import MusicManager
+
 from threading import Thread
 from flask import Flask
 
-# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("metrolist-bot")
 
-# Get Discord token from environment variable
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     logger.error("Please set DISCORD_TOKEN environment variable and restart.")
-    exit(1)
 
-# Bot setup with intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
-# Music manager (per-guild MusicPlayer)
 music = MusicManager()
 
 
-# ---------- EVENTS ----------
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (id: {bot.user.id})")
     logger.info("Ready!")
 
 
-# ---------- COMMANDS ----------
-@bot.command(
-    name="play", help="Play a song (URL or search query). Usage: !play <query>"
-)
+@bot.command(name="play")
 async def play(ctx, *, query: str):
-    async with ctx.typing():  # Shows "Bot is typing..." while processing
+    async with ctx.typing():
         vc = ctx.voice_client
         if not vc:
             if not ctx.author.voice:
@@ -59,7 +38,6 @@ async def play(ctx, *, query: str):
                 return
             channel = ctx.author.voice.channel
             vc = await channel.connect()
-
         player = music.get_player(ctx.guild.id, bot.loop, vc)
         entry = await player.queue_entry(query, requester=ctx.author)
         await ctx.send(
@@ -69,7 +47,7 @@ async def play(ctx, *, query: str):
         )
 
 
-@bot.command(name="skip", help="Skip the currently playing song")
+@bot.command(name="skip")
 async def skip(ctx):
     player = music.get_player_if_exists(ctx.guild.id)
     if not player:
@@ -79,7 +57,7 @@ async def skip(ctx):
     await ctx.send("Skipped.")
 
 
-@bot.command(name="pause", help="Pause playback")
+@bot.command(name="pause")
 async def pause(ctx):
     vc = ctx.voice_client
     if not vc or not vc.is_playing():
@@ -89,7 +67,7 @@ async def pause(ctx):
     await ctx.send("Paused.")
 
 
-@bot.command(name="resume", help="Resume playback")
+@bot.command(name="resume")
 async def resume(ctx):
     vc = ctx.voice_client
     if not vc or not vc.is_paused():
@@ -99,7 +77,7 @@ async def resume(ctx):
     await ctx.send("Resumed.")
 
 
-@bot.command(name="stop", help="Stop and clear queue")
+@bot.command(name="stop")
 async def stop(ctx):
     player = music.get_player_if_exists(ctx.guild.id)
     if not player:
@@ -109,20 +87,38 @@ async def stop(ctx):
     await ctx.send("Stopped and cleared the queue.")
 
 
-@bot.command(name="queue", help="Show current queue")
+@bot.command(name="queue")
 async def show_queue(ctx):
     player = music.get_player_if_exists(ctx.guild.id)
-    if not player or player.queue.empty():
+    if not player:
+        await ctx.send("Nothing is playing.")
+        return
+
+    lines = []
+
+    if player.current:
+        lines.append(
+            f"🎶 Now playing: {player.current.title} ({player.current.requester.display_name})"
+        )
+
+    upcoming = list(player.queue._queue)[:10]
+    for i, track in enumerate(upcoming, start=1):
+        lines.append(f"{i}. {track.title} ({track.requester.display_name})")
+
+    if not lines:
         await ctx.send("Queue is empty.")
         return
-    upcoming = list(player.queue._queue)[:10]
-    desc = "\n".join([f"{i+1}. {e.title}" for i, e in enumerate(upcoming)])
+
     await ctx.send(
-        embed=discord.Embed(title="Upcoming", description=desc, color=0x1DB954)
+        embed=discord.Embed(
+            title=f"Queue for {ctx.guild.name}",
+            description="\n".join(lines),
+            color=0x1DB954,
+        )
     )
 
 
-@bot.command(name="leave", help="Disconnect the bot from voice")
+@bot.command(name="leave")
 async def leave(ctx):
     vc = ctx.voice_client
     if not vc:
@@ -132,8 +128,8 @@ async def leave(ctx):
     await ctx.send("Left voice channel.")
 
 
-@bot.command(name="help", help="Show help")
-async def help(ctx):
+@bot.command(name="helpme")
+async def helpme(ctx):
     help_text = (
         "Commands:\n"
         "!play <query or url> — play or queue a song\n"
@@ -147,7 +143,7 @@ async def help(ctx):
     await ctx.send(f"```\n{help_text}\n```")
 
 
-# ---------- FLASK KEEPALIVE ----------
+# Flask keepalive
 app = Flask("keepalive")
 
 
@@ -160,11 +156,8 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
 
-# ---------- RUN BOT ----------
 if __name__ == "__main__":
-    # Start Flask in a thread (optional for Render)
     if os.getenv("ENABLE_KEEPALIVE", "1") == "1":
         t = Thread(target=run_flask, daemon=True)
         t.start()
-
     bot.run(DISCORD_TOKEN)
