@@ -2,13 +2,11 @@
 """
 Music player helpers. This module defines a MusicManager and a MusicPlayer
 class that handle per-guild queues and playback using yt-dlp and ffmpeg.
+
+Features:
+- Auto-disconnect after inactivity (default 5 min)
+- Auto-disconnect if alone in VC
 """
-
-# (This file content is included below in the same document for clarity.)
-
-
-# ---------- player.py (continued) ----------
-# The real content is below — included as a single file in this canvas for convenience.
 
 import asyncio
 from dataclasses import dataclass
@@ -23,6 +21,7 @@ YTDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
+    "cookiefile": os.getenv("YTDL_COOKIES", "cookies.txt")  # uses env var or default file
 }
 
 FFMPEG_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -vn -hide_banner"
@@ -50,10 +49,10 @@ class MusicPlayer:
         self.queue = asyncio.Queue()
         self.current: Track | None = None
         self.play_next_event = asyncio.Event()
+        self.auto_disconnect_task: asyncio.Task | None = None
         self._task = self.loop.create_task(self.player_loop())
 
     async def queue_entry(self, query: str, requester: discord.Member) -> Track:
-        """Search (or take URL) and queue a Track. Returns the Track queued."""
         info = await self.loop.run_in_executor(
             None, functools.partial(extract_info, query)
         )
@@ -65,13 +64,14 @@ class MusicPlayer:
             requester=requester,
         )
         await self.queue.put(track)
+        # Reset auto-disconnect timer
+        await self.start_auto_disconnect()
         return track
 
     async def player_loop(self):
         while True:
             self.play_next_event.clear()
             self.current = await self.queue.get()
-            # create source
             source = discord.FFmpegPCMAudio(
                 self.current.url,
                 before_options=FFMPEG_OPTIONS,
@@ -81,19 +81,19 @@ class MusicPlayer:
             def after_playing(err):
                 if err:
                     print("Player error:", err)
-                # signal the loop to continue
                 self.loop.call_soon_threadsafe(self.play_next_event.set)
 
             self.voice_client.play(source, after=after_playing)
             await self.play_next_event.wait()
             self.current = None
+            # Start auto-disconnect after finishing song
+            await self.start_auto_disconnect()
 
     async def skip(self):
         if self.voice_client.is_playing():
             self.voice_client.stop()
 
     async def stop(self):
-        # clear queue
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
@@ -102,6 +102,32 @@ class MusicPlayer:
                 break
         if self.voice_client.is_playing() or self.voice_client.is_paused():
             self.voice_client.stop()
+        await self.start_auto_disconnect()
+
+    async def start_auto_disconnect(self, timeout: int = 300):
+        if self.auto_disconnect_task and not self.auto_disconnect_task.done():
+            self.auto_disconnect_task.cancel()
+        self.auto_disconnect_task = self.loop.create_task(
+            self._auto_disconnect(timeout)
+        )
+
+    async def _auto_disconnect(self, timeout: int):
+        await asyncio.sleep(timeout)
+        if not self.voice_client or not self.voice_client.is_connected():
+            return
+        # Leave immediately if alone
+        if len(self.voice_client.channel.members) == 1:
+            await self.voice_client.disconnect()
+            return
+        # Wait a short time for FFmpeg to finalize
+        await asyncio.sleep(1)
+        # Disconnect if nothing is playing and queue is empty
+        if (
+            not self.voice_client.is_playing()
+            and self.queue.empty()
+            and self.current is None
+        ):
+            await self.voice_client.disconnect()
 
 
 class MusicManager:
@@ -129,26 +155,23 @@ class MusicManager:
                     await player.voice_client.disconnect()
                 except Exception:
                     pass
-            # cancel player loop task
             if player._task:
                 player._task.cancel()
+            if player.auto_disconnect_task:
+                player.auto_disconnect_task.cancel()
             del self.players[guild_id]
 
 
-# Helper using yt-dlp
+# yt-dlp helper
 YTDL = yt_dlp.YoutubeDL(YTDL_OPTS)
 
 
 def extract_info(query: str) -> dict:
-    """If query looks like a URL, yt-dlp will use it. Otherwise we use ytsearch1: to search YouTube."""
     if query.startswith("http"):
         inq = query
     else:
         inq = f"ytsearch1:{query}"
     info = YTDL.extract_info(inq, download=False)
-    # if it's a search, yt-dlp returns a playlist with entries
     if "entries" in info:
         info = info["entries"][0]
-    # For streaming we want a URL to feed to ffmpeg. yt-dlp gives us a direct URL in 'url'
-    # Note: depending on extractor it may be necessary to pick a format. We used 'format' in opts.
     return info
